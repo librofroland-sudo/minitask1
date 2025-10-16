@@ -15,12 +15,14 @@ class SquareDriver(Node):
         msg = Twist()
         l = Vector3()
         a = Vector3()
+        
+        time.sleep(0.5)  # wait for publisher
 
         for i in range(4):  # 共 4 条边
             self.get_logger().info(f"------ 第 {i+1} 条边开始 ------")
 
             # ① 前进 1 秒
-            l.x = 1.0; a.z = 0.0
+            l.x = 0.2; a.z = 0.0
             msg.linear = l
             msg.angular = a
             self.publisher_.publish(msg)
