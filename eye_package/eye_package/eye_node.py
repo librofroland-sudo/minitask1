@@ -108,7 +108,7 @@ class ImageSubscriber(Node):
         #  🟩 深绿色垃圾桶 ——严格版 HSV
         # ======================================================
         lower_green = np.array([45, 70, 20])
-        upper_green = np.array([75, 255, 180])
+        upper_green = np.array([77, 255, 180])
         mask_green = cv2.inRange(hsv, lower_green, upper_green)
 
         # ======================================================
