@@ -1,272 +1,255 @@
-#!/usr/bin/env python3
-import rclpy
 import math
+import numpy as np
+
+import rclpy
 from rclpy.node import Node
 
-from geometry_msgs.msg import Quaternion, PointStamped, Point
-from sensor_msgs.msg import Image, CameraInfo
+from geometry_msgs.msg import Point, Twist
+from visualization_msgs.msg import Marker
 from nav_msgs.msg import Odometry
-from cv_bridge import CvBridge
-
-from tf2_ros import TransformListener, Buffer
-from tf2_geometry_msgs import do_transform_point
-
-from rclpy.duration import Duration
-from rclpy.time import Time
-
-import numpy as np
-import cv2
-import pyrealsense2 as rs
+from sensor_msgs.msg import LaserScan
 
 
-# Convert quaternion to roll-pitch-yaw angles
-def quaternion_to_rpy(q: Quaternion):
-    x, y, z, w = q.x, q.y, q.z, q.w
-    sinr_cosp = 2 * (w * x + y * z)
-    cosr_cosp = 1 - 2 * (x * x + y * y)
-    roll = math.atan2(sinr_cosp, cosr_cosp)
-
-    sinp = 2 * (w * y - z * x)
-    pitch = math.copysign(math.pi / 2, sinp) if abs(sinp) >= 1 else math.asin(sinp)
-
-    siny_cosp = 2 * (w * z + x * y)
-    cosy_cosp = 1 - 2 * (y * y + z * z)
-    yaw = math.atan2(siny_cosp, cosy_cosp)
-
-    return roll, pitch, yaw
+# Convert quaternion to yaw angle
+def quat_to_yaw(q):
+    siny = 2.0 * (q.w * q.z + q.x * q.y)
+    cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+    return math.atan2(siny, cosy)
 
 
-# Image subscription and processing node class
-class ImageSubscriber(Node):
-
+class NavNode(Node):
     def __init__(self):
-        super().__init__('eye_node')
+        super().__init__("nav_node")
 
-        # Initialize CvBridge for image format conversion
-        self.br = CvBridge()
+        # Initialization for control and visualization
+        self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
+        self.marker_pub = self.create_publisher(Marker, "/object_markers", 10)
+        self.marker_id = 0
 
-        # Initialize TF buffer and listener for coordinate transformation
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
+        # Initialization for odometry parameters
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_yaw = 0.0
+        self.create_subscription(Odometry, "/odom", self.odom_cb, 10)
 
-        # Subscribe to depth image and color image topics
-        self.create_subscription(Image, '/camera_depth/image_raw', self.image_callback, 10)
-        self.create_subscription(Image, '/camera_depth/depth/image_raw', self.dimage_callback, 10)
+        # Initialization for laser data parameters
+        self.have_scan = False
+        self.laser_ranges = None
+        self.angle_min = 0.0
+        self.angle_increment = 0.0
+        self.create_subscription(LaserScan, "/scan", self.scan_cb, 10)
 
-        # Subscribe to camera intrinsic parameters topic
-        self.create_subscription(CameraInfo, '/camera_depth/camera_info', self.ins_callback, 10)
+        # Initialization for red/green point subscription
+        self.create_subscription(Point, "/green_point", self.green_cb, 10)
+        self.create_subscription(Point, "/red_point", self.red_cb, 10)
 
-        # Subscribe to odometry topic
-        self.create_subscription(Odometry, 'odom', self.odom_callback, 10)
+        # Initialization for waypoint list
+        self.waypoints = [
+            (-1.5, -0.7),
+            (1.0, -3.0),
+            (4.8, 2.0),
+            (5.2, -0.3),
+            (-0.2, 4.3),
+            (3.63, 3.3),
+        ]
+        self.goal_index = 0
 
-        # Create publishers for publishing coordinates of detected green and red points
-        self.green_pub = self.create_publisher(Point, 'green_point', 10)
-        self.red_pub = self.create_publisher(Point, 'red_point', 10)
+        # Artificial Potential Field (APF) parameter configuration
+        self.k_att = 1.2      # Attractive force coefficient
+        self.k_rep = 0.6      # Repulsive force coefficient
+        self.d0 = 0.47         # Effective distance of repulsive force
+        self.v_max = 0.25      # Maximum forward speed
+        self.w_max = 1.0      # Maximum rotation speed (rad/s)
 
-        # Initialize state variables to store image, depth image, camera intrinsics and robot orientation
-        self.image = None
-        self.dimage = None
-        self.ins = None
-        self.orientation = 0.0
+        # Waypoint arrival judgment parameter configuration
+        self.goal_tolerance = 0.20        # Arrival judgment radius (meters)
+        self.goal_stable_cycles = 20      # Threshold of consecutive cycles within the judgment circle (20×0.05s=1 second)
+        self.at_goal_count = 0            # Current number of consecutive cycles within the judgment circle
 
-        # Create a timer to execute image processing logic at 5Hz frequency
-        self.timer = self.create_timer(0.2, self.timer_callback)
+        # Main loop 20Hz
+        self.timer = self.create_timer(0.05, self.main_loop)
 
-        self.get_logger().info("eye_node started successfully, waiting for camera data...")
+        self.get_logger().info("APF NavNode started.")
 
+    # Odometry callback function
+    def odom_cb(self, msg):
+        self.robot_x = msg.pose.pose.position.x
+        self.robot_y = msg.pose.pose.position.y
+        self.robot_yaw = quat_to_yaw(msg.pose.pose.orientation)
 
-    # Various callback functions
-    def odom_callback(self, msg):
-        # Extract and update the robot's orientation (yaw angle) from the odometry message
-        _, _, self.orientation = quaternion_to_rpy(msg.pose.pose.orientation)
+    # Laser scan data callback function
+    def scan_cb(self, msg):
+        ranges = np.array(msg.ranges, dtype=np.float32)
+        ranges = np.clip(ranges, 0.0, 5.0)
+        self.laser_ranges = ranges
+        self.angle_min = msg.angle_min
+        self.angle_increment = msg.angle_increment
+        self.have_scan = True
 
-    def ins_callback(self, msg):
-        # Store camera intrinsic parameters information
-        self.ins = msg
+    # Red/green point marker publishing function
+    def publish_marker(self, p, color):
+        m = Marker()
+        m.header.frame_id = "map"
+        m.header.stamp = self.get_clock().now().to_msg()
+        m.ns = "objects"
+        m.id = self.marker_id
+        self.marker_id += 1
 
-    def image_callback(self, msg):
-        # Convert ROS image message to OpenCV format color image
-        self.image = self.br.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.scale.x = m.scale.y = m.scale.z = 0.3
+        m.pose.position.x = p.x
+        m.pose.position.y = p.y
+        m.pose.position.z = 0.1
+        m.color.a = 1.0
 
-    def dimage_callback(self, msg):
-        # Convert ROS image message to OpenCV format depth image
-        self.dimage = self.br.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        if color == "GREEN":
+            m.color.g = 1.0
+        else:
+            m.color.r = 1.0
 
+        self.marker_pub.publish(m)
 
-    # Get TF transformation from camera coordinate system to map coordinate system
-    def tf_from_cam_to_map(self):
+    def green_cb(self, msg):
+        self.publish_marker(msg, "GREEN")
 
-        try:
-            tf = self.tf_buffer.lookup_transform(
-                'map',
-                'camera_rgb_optical_frame',
-                Time(),                           # Use the latest timestamp
-                timeout=Duration(seconds=0.5)
-            )
-            return tf
+    def red_cb(self, msg):
+        self.publish_marker(msg, "RED")
 
-        except Exception as e:
-            self.get_logger().warn(f"TF transformation failed: {e}")
-            return None
-
-
-    # Image processing and target coordinate publishing logic
-    def timer_callback(self):
-
-        # Return directly if image, depth image or camera intrinsics are not obtained
-        if self.image is None or self.dimage is None or self.ins is None:
+    # Main loop processing function
+    def main_loop(self):
+        if self.goal_index >= len(self.waypoints):
+            self.stop_robot()
             return
 
-        frame = self.image
-        depth_frame = self.dimage
+        if not self.have_scan:
+            self.stop_robot()
+            return
 
-        # Convert color image from BGR format to HSV format for color segmentation
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        gx, gy = self.waypoints[self.goal_index]
 
-        # Green target detection: set HSV color range and generate mask
-        lower_green = np.array([45, 70, 20])
-        upper_green = np.array([75, 255, 180])
-        mask_green = cv2.inRange(hsv, lower_green, upper_green)
+        dx = gx - self.robot_x
+        dy = gy - self.robot_y
+        dist = math.hypot(dx, dy)
 
-        # Red target detection: red is divided into two ranges in HSV space, merge masks
-        lower_red1 = np.array([0, 150, 50])
-        upper_red1 = np.array([8, 255, 255])
-        lower_red2 = np.array([172, 150, 50])
-        upper_red2 = np.array([180, 255, 255])
-        mask_red = cv2.inRange(hsv, lower_red1, upper_red1) + cv2.inRange(hsv, lower_red2, upper_red2)
+        # Waypoint arrival judgment logic
+        if dist < self.goal_tolerance:
+            self.at_goal_count += 1
+        else:
+            self.at_goal_count = 0
 
-        # Morphological opening operation to denoise and eliminate small interference areas
-        kernel = np.ones((5, 5), np.uint8)
-        mask_green = cv2.morphologyEx(mask_green, cv2.MORPH_OPEN, kernel)
-        mask_red = cv2.morphologyEx(mask_red, cv2.MORPH_OPEN, kernel)
-
-        # Find the largest circular target that meets the conditions from the mask and return the centroid coordinates
-        def find_target(mask):
-
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-            best = None
-            best_area = 0
-
-            for cnt in contours:
-                area = cv2.contourArea(cnt)
-                # Filter out contours with too small area
-                if area < 800:
-                    continue
-
-                peri = cv2.arcLength(cnt, True)
-                if peri == 0:
-                    continue
-
-                # Calculate the circularity of the contour to filter out non-circular targets
-                circularity = 4 * math.pi * (area / (peri * peri))
-                if circularity < 0.3:
-                    continue
-
-                # Record the target contour with the largest area
-                if area > best_area:
-                    best_area = area
-                    best = cnt
-
-            if best is None:
-                return None
-
-            # Calculate the centroid of the contour
-            M = cv2.moments(best)
-            if M["m00"] == 0:
-                return None
-
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-
-            return (cx, cy)
-
-        # Find centroids of green and red targets
-        centroid_green = find_target(mask_green)
-        centroid_red = find_target(mask_red)
-
-
-        # Process target centroids, calculate world coordinates and publish
-        def process_color(centroid, pub, color_name):
-
-            if centroid is None:
-                return None
-
-            cx, cy = centroid
-
-            # Get the depth value at the centroid position
-            depth_val = float(depth_frame[cy, cx])
-            if depth_val <= 0.0 or math.isnan(depth_val):
-                return None
-
-            cam = self.ins
-
-            # Configure RealSense camera intrinsics
-            intr = rs.intrinsics()
-            intr.width = cam.width
-            intr.height = cam.height
-            intr.ppx = cam.k[2]
-            intr.ppy = cam.k[5]
-            intr.fx = cam.k[0]
-            intr.fy = cam.k[4]
-            intr.model = rs.distortion.none
-            intr.coeffs = list(cam.d)
-
-            # Convert pixel coordinates and depth value to 3D point in camera coordinate system
-            p3d = rs.rs2_deproject_pixel_to_point(intr, [cx, cy], depth_val)
-
-            # Construct point message in camera coordinate system
-            point_cam = PointStamped()
-            point_cam.header.frame_id = 'camera_rgb_optical_frame'
-            point_cam.point.x = p3d[0]
-            point_cam.point.y = p3d[1]
-            point_cam.point.z = p3d[2]
-
-            # Get coordinate transformation from camera to map
-            tf = self.tf_from_cam_to_map()
-            if tf is None:
-                return None
-
-            # Convert point from camera coordinate system to map coordinate system
-            point_world = do_transform_point(point_cam, tf)
-
-            # Publish target point coordinates in map coordinate system
-            msg = Point()
-            msg.x = point_world.point.x
-            msg.y = point_world.point.y
-            msg.z = point_world.point.z
-            pub.publish(msg)
-
+        if self.at_goal_count >= self.goal_stable_cycles:
             self.get_logger().info(
-                f"{color_name} target → world coordinates: ({msg.x:.2f}, {msg.y:.2f}, {msg.z:.2f})"
+                f"Arrived waypoint {self.goal_index} (dist={dist:.2f}), rotating then going to next."
             )
+            self.rotate_one_circle()
+            self.goal_index += 1
+            self.at_goal_count = 0
+            return
 
-            return (cx, cy)
+        # Calculate attractive force
+        goal_angle = math.atan2(dy, dx)
+        goal_angle_robot = (goal_angle - self.robot_yaw + math.pi) % (2*math.pi) - math.pi
 
-        # Process green and red targets and publish coordinates
-        gp = process_color(centroid_green, self.green_pub, "Green")
-        rp = process_color(centroid_red, self.red_pub, "Red")
+        F_att_x = self.k_att * math.cos(goal_angle_robot)
+        F_att_y = self.k_att * math.sin(goal_angle_robot)
 
-        # Visualization result: mark target centroids on the original image
-        debug = frame.copy()
-        if gp: cv2.circle(debug, gp, 6, (0, 255, 0), -1)
-        if rp: cv2.circle(debug, rp, 6, (0, 0, 255), -1)
+        # Calculate repulsive force
+        F_rep_x, F_rep_y = self.compute_repulsive_force()
 
-        # Display processed image and masks
-        cv2.imshow("camera", debug)
-        cv2.imshow("green_mask", mask_green)
-        cv2.imshow("red_mask", mask_red)
-        cv2.waitKey(1)
+        # Calculate resultant force
+        Fx = F_att_x + F_rep_x
+        Fy = F_att_y + F_rep_y
+
+        force_angle = math.atan2(Fy, Fx)
+        forward_component = math.cos(force_angle)
+
+        cmd = Twist()
+        # Rotation speed control (positive = turn left, negative = turn right)
+        cmd.angular.z = max(-self.w_max, min(self.w_max, force_angle))
+
+        # Forward speed control
+        if forward_component < 0:
+            cmd.linear.x = 0.0
+        else:
+            cmd.linear.x = min(self.v_max, self.v_max * forward_component)
+
+        self.cmd_pub.publish(cmd)
+
+    # Repulsive force calculation function (fixed deflection ±90°)
+    def compute_repulsive_force(self):
+        ranges = self.laser_ranges
+        n = len(ranges)
+
+        # Unify angles to (-pi, pi), aligned with robot coordinate system
+        angles = self.angle_min + np.arange(n) * self.angle_increment
+        angles = (angles + math.pi) % (2*math.pi) - math.pi
+
+        Fx, Fy = 0.0, 0.0
+
+        for d, ang in zip(ranges, angles):
+
+            if d < 0.05 or d >= self.d0:
+                continue
+
+            # Calculate repulsive force magnitude
+            diff = 1.0/d - 1.0/self.d0
+            mag = self.k_rep * diff / (d*d + 1e-6)
+
+            # Fixed deflection ±90° (π/2)
+            turn = math.pi / 2   # 90°
+
+            # Left obstacle (ang<0) → turn right (+90°)
+            # Right obstacle (ang>0) → turn left (-90°)
+            if ang < 0:
+                rep_angle = ang + turn     # Turn right
+            else:
+                rep_angle = ang - turn     # Turn left
+
+            fx = mag * math.cos(rep_angle)
+            fy = mag * math.sin(rep_angle)
+
+            Fx += fx
+            Fy += fy
+
+        return Fx, Fy
+
+    # Action to execute after reaching target: stop for 1 second → rotate one circle → stop for another 1 second
+    def rotate_one_circle(self):
+        # Stop for 1 second
+        stop_cmd = Twist()
+        t_end_pause = self.get_clock().now().nanoseconds + int(1.0 * 1e9)  # Stop for 1 second
+        while self.get_clock().now().nanoseconds < t_end_pause:
+            self.cmd_pub.publish(stop_cmd)
+
+        # Rotate one circle (speed 90°/s, duration 4 seconds)
+        cmd = Twist()
+        cmd.angular.z = math.radians(60)    # 60°/s
+        duration = 6.0                       # Rotate for 4 seconds
+
+        t_end_spin = self.get_clock().now().nanoseconds + int(duration * 1e9)
+        while self.get_clock().now().nanoseconds < t_end_spin:
+            self.cmd_pub.publish(cmd)
+            
+        # Stop for another 1 second
+        stop_cmd = Twist()
+        t_end_pause = self.get_clock().now().nanoseconds + int(1.0 * 1e9)  # Stop for 1 second
+        while self.get_clock().now().nanoseconds < t_end_pause:
+            self.cmd_pub.publish(stop_cmd)
+
+        # Stop the robot
+        self.stop_robot()
+
+    def stop_robot(self):
+        self.cmd_pub.publish(Twist())
 
 
-# Main function
 def main(args=None):
     rclpy.init(args=args)
-    node = ImageSubscriber()
+    node = NavNode()
     rclpy.spin(node)
-    node.destroy_node()
     rclpy.shutdown()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
